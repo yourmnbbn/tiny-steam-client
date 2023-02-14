@@ -5,6 +5,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 20)
 
 include_directories (
+    ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${HL2SDK-CSGO}/common/protobuf-2.5.0/src
     ${ASIO-SRC}/include
@@ -25,19 +26,27 @@ if(MSVC)
         -D COMPILER_MSVC
         -D COMPILER_MSVC32
         -D _SILENCE_CXX17_ITERATOR_BASE_CLASS_DEPRECATION_WARNING
+        -D CURL_STATICLIB
     )
     
     set(STATIC_LIB_LIST 
         cryptlib.lib
         libprotobuf.lib
+        libcurl_a.lib
+        msvcrt.lib
+        normaliz.lib
+        crypt32.lib
+        wldap32.lib
     )
     
     link_directories(
         ${HL2SDK-CSGO}/lib/win32/release/vs2017
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/win32/crypto
+        ${CMAKE_CURRENT_SOURCE_DIR}/lib/win32/curl
     )
     add_compile_options(/MT)
     add_compile_options(/wd4819)
+    add_link_options(/NODEFAULTLIB:libcmt.lib)
 
 endif()
 

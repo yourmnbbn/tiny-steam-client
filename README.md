@@ -1,5 +1,5 @@
 # tiny-steam-client
- A replacement of steam_api for tiny-csgo-client and tiny-csgo-server.   
+ A replacement of steam_api for [tiny-csgo-client](https://github.com/yourmnbbn/tiny-csgo-client) and [tiny-csgo-server](https://github.com/yourmnbbn/tiny-csgo-server).   
 
  Currently it's a very incomplete project. It's a demo of how to establish encrypted channel with steam CM server and logon your steam account. In the future, tiny-steam-client will be designed as a replacement for steam_api to get rid of the tons of limitations brought by steam_api.  
 
@@ -8,7 +8,9 @@
 ## Dependencies
  - [hl2sdk-csgo](https://github.com/alliedmodders/hl2sdk)
  - [Asio](https://github.com/chriskohlhoff/asio) 
- - [cryptopp](https://github.com/weidai11/cryptopp)
+ - [cryptopp-8.7.0](https://github.com/weidai11/cryptopp)
+ - [curl-7.87.0](https://github.com/curl/curl) (provided in source)
+ - [json](https://github.com/nlohmann/json) (provided in source)
  - CMake
 
 ## Compile and Run (Currently windows only)
@@ -18,7 +20,7 @@
 4. Run `tiny-steam-client.exe` with necessary commandline.
 
  ## Command option notes
-- `-cm` CM server socket. (e.g. 127.0.0.1:27016) CM server list can be optained by this web api: https://api.steampowered.com/ISteamDirectory/GetCMList/v1/?format=json&cellid=0
+- `-cm` CM server socket. (e.g. 127.0.0.1:27016) This parameter is optional, if you don't specify the server, the program will automatically load CM server from local cache or request from [web api](https://api.steampowered.com/ISteamDirectory/GetCMList/v1/?format=json&cellid=0).
 - `-user` Steam account username.
 - `-pw` Steam account password.
 
