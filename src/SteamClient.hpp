@@ -1,39 +1,49 @@
 #ifndef __TINY_STEAM_CLIENT_STEAMCLIENT_HPP__
 #define __TINY_STEAM_CLIENT_STEAMCLIENT_HPP__
 
+#include <chrono>
 #include <asio.hpp>
 #include "argparser.hpp"
 #include "SteamEncryptedChannel.hpp"
 #include "bitbuf/bitbuf.h"
 #include "consts/logonresult.hpp"
 #include "proto/steammessages_clientserver_login.pb.h"
+#include "proto/enums_clientserver.pb.h"
+#include "steam/steamclientpublic.h"
 
 using namespace asio::ip;
 
 inline asio::io_context g_IoContext;
 
-inline constexpr auto MAGIC = 0x31305456;
-inline constexpr auto AES_KEY_LENGTH = 32;
+inline constexpr auto MAGIC						= 0x31305456;
+inline constexpr auto AES_KEY_LENGTH			= 32;
+inline constexpr auto PROTO_MASK				= (1 << 31);
 
-//TODO: Change to a more proper way of defining the protobuf enums and constances
-inline constexpr auto EMSG_EncryptChannelRequest	= 0x517;
-inline constexpr auto EMSG_EncryptChannelResponse	= 0x518;
-inline constexpr auto EMSG_EncryptChannelResult		= 0x519;
-inline constexpr auto EMSG_ClientLogon				= 5514;
-inline constexpr auto EMSG_ClientLogonResponse		= 751;
-inline constexpr auto EMSG_MsgMulti					= 1;
-inline constexpr auto EncryptChannelResult_OK		= 1;
-inline constexpr auto PROTO_MASK					= (1 << 31);
+inline constexpr auto CLIENT_PROTOCOL_VERSION	= 65580;
 
-inline constexpr auto CLIENT_PROTOCOL_VERSION		= 65580;
+class SteamClient;
+
+class NetMsgHandler
+{
+public:
+	static void SetSteamClientPtr(SteamClient* cl) { m_pSteamClient = cl; }
+	static asio::awaitable<void> HandleMessage(tcp::socket& socket, uint32_t type, void* pData, size_t dataLen);
+private:
+	template<typename MsgObjType>
+	static MsgObjType protomsg_cast(const void* data, size_t length);
+private:
+	static SteamClient* m_pSteamClient;
+};
 
 class SteamClient
 {
+	friend class NetMsgHandler;
 public:
 	SteamClient(ArgParser parser) :
 		m_Writer(m_WriteBuf, sizeof(m_WriteBuf)), 
 		m_Parser(parser)
 	{
+		NetMsgHandler::SetSteamClientPtr(this);
 	}
 public:
 	void SetAccount(const char* username, const char* pw)
@@ -94,9 +104,9 @@ private:
 			co_return;
 
 		auto proto_index = reader.ReadLong();
-		if (proto_index != EMSG_EncryptChannelRequest)
+		if (proto_index != k_EMsgChannelEncryptRequest)
 		{
-			printf("Expect protobuf %d but got %d!\n", EMSG_EncryptChannelRequest, proto_index);
+			printf("Expect protobuf %d but got %d!\n", k_EMsgChannelEncryptRequest, proto_index);
 			co_return;
 		}
 
@@ -125,7 +135,7 @@ private:
 		//Form encrypt channel response
 		m_Writer.WriteLong(36 + cipherLen);
 		m_Writer.WriteLong(MAGIC);
-		m_Writer.WriteLong(EMSG_EncryptChannelResponse);
+		m_Writer.WriteLong(k_EMsgChannelEncryptResponse);
 		m_Writer.WriteLongLong(sourceJobID);
 		m_Writer.WriteLongLong(targetJobID);
 		m_Writer.WriteLong(protocol);
@@ -148,16 +158,16 @@ private:
 			co_return;
 
 		auto proto_index = reader.ReadLong();
-		if (proto_index != EMSG_EncryptChannelResult)
+		if (proto_index != k_EMsgChannelEncryptResult)
 		{
-			printf("Expect protobuf %d but got %d!\n", EMSG_EncryptChannelResult, proto_index);
+			printf("Expect protobuf %d but got %d!\n", k_EMsgChannelEncryptResult, proto_index);
 			co_return;
 		}
 		
 		auto sourceJobID = reader.ReadLongLong();
 		auto targetJobID = reader.ReadLongLong();
 		auto result = reader.ReadLong();
-		if (result != EncryptChannelResult_OK)
+		if (result != k_EResultOK)
 		{
 			printf("EncryptChannelResult received failure code %d!\n", result);
 			co_return;
@@ -171,6 +181,13 @@ private:
 	{
 		printf("Logging on to steam, account: %s ...\n", username);
 
+		
+		CMsgProtoBufHeader header;
+		header.set_client_sessionid(0);
+		header.set_steamid(0x0110000100000000);
+		header.set_jobid_source(-1);
+		header.set_jobid_target(-1);
+
 		//TODO: Form a more proper logon message here
 		CMsgClientLogon logon;
 		logon.set_account_name(username);
@@ -182,18 +199,32 @@ private:
 		logon.set_should_remember_password(false);
 		logon.set_steam2_ticket_request(0);
 
-		co_await SendMessageToCM(socket, EMSG_ClientLogon, logon);
-		auto len = co_await socket.async_read_some(asio::buffer(m_ReadBuf, sizeof(m_ReadBuf)), asio::use_awaitable);
-
-		co_await DecryptIncommingPacket(socket, len);
+		co_await SendMessageToCM(socket, k_EMsgClientLogon, header, logon);
+		co_await StartMessageReceiver(socket);
 	}
 
-	asio::awaitable<void>	DecryptIncommingPacket(tcp::socket& socket, size_t length)
+	asio::awaitable<void>	StartMessageReceiver(tcp::socket& socket)
+	{
+		while (true)
+		{
+			auto len = co_await socket.async_read_some(asio::buffer(m_ReadBuf, sizeof(m_ReadBuf)), asio::use_awaitable);
+			len = co_await DecryptIncommingPacket(len);
+			if (len < 0)
+			{
+				printf("Received error detected!\n");
+				continue;
+			}
+
+			co_await HandleIncommingPacket(socket, len);
+		}
+	}
+
+	asio::awaitable<size_t>	DecryptIncommingPacket(size_t length)
 	{
 		bf_read reader(m_ReadBuf, length);
 		auto payloadLength = CheckPacketHeader(reader, length);
 		if (payloadLength < 1)
-			co_return;
+			co_return 0;
 
 		//Decrypt received cipher
 		std::unique_ptr<char[]> memBlock = std::make_unique<char[]>(payloadLength);
@@ -204,15 +235,15 @@ private:
 			payloadLength);
 
 		memcpy(m_ReadBuf, memBlock.get(), plainTextLength);
-		co_await HandleIncommingPacket(socket, plainTextLength);
+		co_return plainTextLength;
 	}
 
 	asio::awaitable<void> HandleIncommingPacket(tcp::socket& socket, size_t length)
 	{
 		auto eproto = *reinterpret_cast<uint32_t*>(m_ReadBuf) & 0xFFFF;
-		
-		//TODO: Handle multi message elsewhere
-		if (eproto == EMSG_MsgMulti)
+
+		//Handle multi message immediately
+		if (eproto == k_EMsgMulti)
 		{
 			CMsgMulti multi;
 			multi.ParseFromArray(m_ReadBuf + 8, length - 8); //skip proto index and header length
@@ -253,42 +284,60 @@ private:
 			co_return;
 		}
 
-		if (eproto != EMSG_ClientLogonResponse)
+		//Handle login messages here
+		auto headerLen = *reinterpret_cast<uint32_t*>(m_ReadBuf + 4);
+		if (eproto == k_EMsgClientLogOnResponse)
 		{
-			printf("For now we don't handler for (%d)\t%s\n", eproto, GetProtobufNameFromIndex(eproto));
-			co_return;
+			CMsgClientLogonResponse logonResponse;
+			logonResponse.ParseFromArray(m_ReadBuf + 8 + headerLen, length - 8 - headerLen);
+			auto logonResult = logonResponse.eresult();
+			printf("Logon result: %s(%d)\n", s_LogonResult[logonResult], logonResult);
+
+			switch (logonResult)
+			{
+			case 1:
+				printf("Logon success!\n");
+				m_SteamID = logonResponse.client_supplied_steamid();
+				m_HeartbeatInterval = logonResponse.heartbeat_seconds();
+				
+				//Start heart beat process
+				asio::co_spawn(g_IoContext, HeartbeatHandler(socket), asio::detached);
+				break;
+			case 85:
+			case 63:
+				printf("Please turn off steam guard to logon via tiny-steam-client!\n");
+				g_IoContext.stop();
+				break;
+			}
 		}
 
-		//TODO: Properly handle CMsgClientLogonResponse and handle elsewhere
-		auto headerLen = *reinterpret_cast<uint32_t*>(m_ReadBuf + 4);
-		
-		CMsgClientLogonResponse logonResponse;
-		logonResponse.ParseFromArray(m_ReadBuf + 8 + headerLen, length - 8 - headerLen);
+		co_await NetMsgHandler::HandleMessage(socket, eproto, m_ReadBuf + 8 + headerLen, length - 8 - headerLen);
+	}
 
-		auto logonResult = logonResponse.eresult();
-		printf("Logon result: %s(%d)\n", s_LogonResult[logonResult], logonResult);
-
-		switch (logonResult)
+	asio::awaitable<void> HandleImcommingPacket(tcp::socket& socket)
+	{
+		while (true)
 		{
-		case 1: 
-			printf("Logon success!\n");
-			break;
-		case 85:
-		case 63:
-			printf("Please turn off steam guard to logon via tiny-steam-client!\n");
-			break;
+			auto len = co_await socket.async_read_some(asio::buffer(m_ReadBuf, sizeof(m_ReadBuf)), asio::use_awaitable);
+			GetCryptoTool().PrintHexBuffer(m_ReadBuf, len);
 		}
 	}
 
-	asio::awaitable<void>	SendMessageToCM(tcp::socket& socket, uint32_t type, google::protobuf::Message& msg)
+	asio::awaitable<void> HeartbeatHandler(tcp::socket& socket)
 	{
-		//TODO: Don't hardcode these
-		CMsgProtoBufHeader header;
-		header.set_client_sessionid(0);
-		header.set_steamid(0x0110000100000000); //TODO: Properly generate steamid.
-		header.set_jobid_source(-1);
-		header.set_jobid_target(-1);
+		while (true)
+		{
+			asio::steady_timer timer(g_IoContext, std::chrono::seconds(m_HeartbeatInterval));
+			co_await timer.async_wait(asio::use_awaitable);
 
+			CMsgProtoBufHeader header;
+			CMsgClientHeartBeat heartbeat;
+			co_await SendMessageToCM(socket, k_EMsgClientHeartBeat, header, heartbeat);
+		}
+	}
+
+	asio::awaitable<void>	SendMessageToCM(tcp::socket& socket, uint32_t type, google::protobuf::Message& header, google::protobuf::Message& msg)
+	{
 		auto headerLen = header.ByteSize();
 		auto msgLen = headerLen + 8 + msg.ByteSize();
 		std::unique_ptr<char[]> msgBlock = std::make_unique<char[]>(msgLen);
@@ -331,32 +380,6 @@ public:
 	}
 
 private:
-	//TODO: This demo function will be deleted in the future
-	const char* GetProtobufNameFromIndex(int index)
-	{
-		switch (index)
-		{
-		case 5501:	return "ClientServersAvailable";
-		case 768:	return "ClientAccountInfo";
-		case 5456:	return "ClientEmailAddrInfo";
-		case 767:	return "ClientFriendsList";
-		case 5587:	return "ClientPlayerNicknameList";
-		case 780:	return "ClientLicenseList";
-		case 798:	return "ClientUpdateGuestPassesList";
-		case 5528:	return "ClientWalletInfoUpdate";
-		case 779:	return "ClientGameConnectTokens";
-		case 783:	return "ClientCMList";
-		case 5480:	return "ClientRequestedClientStats";
-		case 9600:	return "ClientPlayingSessionState";
-		case 782:	return "ClientVACBanStatus";
-		case 5430:	return "ClientIsLimitedAccount";
-		case 5537:	return "ClientUpdateMachineAuth";
-		default:
-			return "UnknownForNow";
-		}
-	}
-
-private:
 	ArgParser& m_Parser;
 
 	char m_WriteBuf[8192];
@@ -370,8 +393,33 @@ private:
 	std::string m_AccountName;
 	std::string m_AccountPassWord;
 
+	uint64_t	m_SteamID = 0;
+	uint32_t	m_HeartbeatInterval = 5;
+
 	tcp::endpoint	m_CMServerEdp;
 };
 
+inline SteamClient* NetMsgHandler::m_pSteamClient = nullptr;
+
+template<typename MsgObjType>
+inline MsgObjType NetMsgHandler::protomsg_cast(const void* data, size_t length)
+{
+	MsgObjType obj;
+	obj.ParseFromArray(data, length);
+	return obj;
+}
+
+inline asio::awaitable<void> NetMsgHandler::HandleMessage(tcp::socket& socket, uint32_t type, void* pData, size_t dataLen)
+{
+	switch (type)
+	{
+
+	default:
+		printf("Received protobuf %d but we don't have handler for it.\n", type);
+		break;
+	}
+
+	co_return;
+}
 
 #endif // !__TINY_STEAM_CLIENT_STEAMCLIENT_HPP__
