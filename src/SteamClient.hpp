@@ -2,12 +2,15 @@
 #define __TINY_STEAM_CLIENT_STEAMCLIENT_HPP__
 
 #include <chrono>
+#include <queue>
+#include <ctime>
 #include <asio.hpp>
 #include "argparser.hpp"
 #include "SteamEncryptedChannel.hpp"
 #include "bitbuf/bitbuf.h"
 #include "consts/logonresult.hpp"
 #include "proto/steammessages_clientserver_login.pb.h"
+#include "proto/steammessages_clientserver.pb.h"
 #include "proto/enums_clientserver.pb.h"
 #include "steam/steamclientpublic.h"
 
@@ -174,6 +177,8 @@ private:
 		}
 
 		printf("Successfully established encrypted channel with Steam CM server!\n");
+		m_TimeWhenConnectedToCM = time(nullptr);
+
 		co_await UserLogon(socket, m_AccountName.c_str(), m_AccountPassWord.c_str());
 	}
 
@@ -288,6 +293,11 @@ private:
 		auto headerLen = *reinterpret_cast<uint32_t*>(m_ReadBuf + 4);
 		if (eproto == k_EMsgClientLogOnResponse)
 		{
+			CMsgProtoBufHeader logonResponseHdr;
+			logonResponseHdr.ParseFromArray(m_ReadBuf + 8, headerLen);
+			m_SessionID = logonResponseHdr.client_sessionid();
+			m_SteamID = logonResponseHdr.steamid();
+
 			CMsgClientLogonResponse logonResponse;
 			logonResponse.ParseFromArray(m_ReadBuf + 8 + headerLen, length - 8 - headerLen);
 			auto logonResult = logonResponse.eresult();
@@ -296,13 +306,25 @@ private:
 			switch (logonResult)
 			{
 			case 1:
-				printf("Logon success!\n");
-				m_SteamID = logonResponse.client_supplied_steamid();
+			{
 				m_HeartbeatInterval = logonResponse.heartbeat_seconds();
+				m_PublicIP = logonResponse.public_ip().v4();
 				
+				printf("Generating app auth session ticket...\n");
+				//Send request to get csgo's ownership ticket
+				CMsgProtoBufHeader header;
+				header.set_client_sessionid(m_SessionID);
+				header.set_steamid(m_SteamID);
+				header.set_jobid_source(1);
+				
+				CMsgClientGetAppOwnershipTicket getTicket;
+				getTicket.set_app_id(730);
+				co_await SendMessageToCM(socket, k_EMsgClientGetAppOwnershipTicket, header, getTicket);
+
 				//Start heart beat process
 				asio::co_spawn(g_IoContext, HeartbeatHandler(socket), asio::detached);
 				break;
+			}
 			case 85:
 			case 63:
 				printf("Please turn off steam guard to logon via tiny-steam-client!\n");
@@ -312,15 +334,6 @@ private:
 		}
 
 		co_await NetMsgHandler::HandleMessage(socket, eproto, m_ReadBuf + 8 + headerLen, length - 8 - headerLen);
-	}
-
-	asio::awaitable<void> HandleImcommingPacket(tcp::socket& socket)
-	{
-		while (true)
-		{
-			auto len = co_await socket.async_read_some(asio::buffer(m_ReadBuf, sizeof(m_ReadBuf)), asio::use_awaitable);
-			GetCryptoTool().PrintHexBuffer(m_ReadBuf, len);
-		}
 	}
 
 	asio::awaitable<void> HeartbeatHandler(tcp::socket& socket)
@@ -394,7 +407,17 @@ private:
 	std::string m_AccountPassWord;
 
 	uint64_t	m_SteamID = 0;
+	int32_t		m_SessionID = 0;
 	uint32_t	m_HeartbeatInterval = 5;
+
+	//Used for auth session ticket generation
+	uint32_t	m_ConnectTimes = 0;
+	time_t		m_TimeWhenConnectedToCM;
+	uint8_t		m_OwnershipTicket[2048];
+	uint32_t	m_OwnershipTicketLength = 0;
+	uint32_t	m_PublicIP;
+	bool		m_OwnerShipTicketValid = false;
+	std::queue<std::string> m_GCTokens;
 
 	tcp::endpoint	m_CMServerEdp;
 };
@@ -413,7 +436,63 @@ inline asio::awaitable<void> NetMsgHandler::HandleMessage(tcp::socket& socket, u
 {
 	switch (type)
 	{
+	case k_EMsgClientGetAppOwnershipTicketResponse:
+	{
+		auto response = protomsg_cast<CMsgClientGetAppOwnershipTicketResponse>(pData, dataLen);
+		if (response.eresult() != k_EResultOK)
+		{
+			printf("Get app owner ship response with failure code %d\n", response.eresult());
+			co_return;
+		}
 
+		if (response.ticket().size() != 178)
+		{
+			printf("Got unexpected ownership ticket length:%d", response.ticket().size());
+			co_return;
+		}
+
+		time_t expiretime = *reinterpret_cast<const uint32_t*>(response.ticket().c_str() + 36);
+		auto* tm = gmtime(&expiretime);
+		printf("Get app ownership ticket success! Ownership ticket will be expired after %d/%d/%d(Y/M/D)\n", tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday);;
+
+		m_pSteamClient->m_OwnerShipTicketValid = true;
+		m_pSteamClient->m_OwnershipTicketLength = response.ticket().size();
+		memcpy(m_pSteamClient->m_OwnershipTicket, response.ticket().c_str(), response.ticket().size());
+
+		//Form a proper auth session ticket
+		auto& token = m_pSteamClient->m_GCTokens.front();
+		
+		char temp[2048];
+		bf_write writer(temp, sizeof(temp));
+		writer.WriteLong(token.size());
+		writer.WriteBytes(token.c_str(), token.size());
+		writer.WriteLong(24);
+		writer.WriteLong(1);
+		writer.WriteLong(2);
+		writer.WriteLong(m_pSteamClient->m_PublicIP);
+		writer.WriteLong(0);
+		writer.WriteLong((time(nullptr) + token.c_str()[0] - m_pSteamClient->m_TimeWhenConnectedToCM) * 1000);
+		writer.WriteLong(++(m_pSteamClient->m_ConnectTimes));
+		writer.WriteLong(response.ticket().size());
+		writer.WriteBytes(response.ticket().c_str(), response.ticket().size());
+
+		m_pSteamClient->m_GCTokens.pop();
+
+		//So far we just print the ticket
+		printf("Following is the generated auth session ticket:\n");
+		GetCryptoTool().PrintHexBuffer(temp, writer.GetNumBytesWritten());
+		break;
+	}
+	case k_EMsgClientGameConnectTokens:
+	{
+		auto tokens = protomsg_cast<CMsgClientGameConnectTokens>(pData, dataLen);
+		printf("Received %d game connect tokens\n", tokens.tokens().size());
+		for (auto& token : tokens.tokens())
+		{
+			m_pSteamClient->m_GCTokens.push(token);
+		}
+		break;
+	}
 	default:
 		printf("Received protobuf %d but we don't have handler for it.\n", type);
 		break;
