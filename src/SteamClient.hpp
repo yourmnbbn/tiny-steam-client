@@ -555,7 +555,7 @@ inline asio::awaitable<void> NetMsgHandler::HandleMessage(tcp::socket& socket, u
 
 		m_pSteamClient->m_GCTokens.pop();
 
-		//So far we just print the ticket
+		//print the ticket
 		printf("Following is the generated auth session ticket:\n");
 		GetCryptoTool().PrintHexBuffer(temp, writer.GetNumBytesWritten());
 
@@ -608,8 +608,88 @@ inline asio::awaitable<void> NetMsgHandler::HandleMessage(tcp::socket& socket, u
 		printf("[%llu]Log off from steam, reason: %d\n", m_pSteamClient->m_SteamID, msg.eresult());
 		break;
 	}
+	case k_EMsgClientAccountInfo:
+	{
+		auto msg = protomsg_cast<CMsgClientAccountInfo>(pData, dataLen);
+		printf("Username:%s, country: %s\n", msg.persona_name().c_str(), msg.ip_country().c_str());
+		break;
+	}
+	case k_EMsgClientEmailAddrInfo:
+	{
+		auto msg = protomsg_cast<CMsgClientEmailAddrInfo>(pData, dataLen);
+		printf("Client emial %s(validated %s)\n",
+			msg.email_address().c_str(),
+			msg.email_is_validated() ? "yes" : "no"
+		);
+		break;
+	}
+	case k_EMsgClientWalletInfoUpdate:
+	{
+		auto msg = protomsg_cast<CMsgClientWalletInfoUpdate>(pData, dataLen);
+		printf("Client %s a wallet, currency %d, balance %.2f\n",
+			msg.has_wallet() ? "has" : "doesn't have",
+			msg.currency(),
+			static_cast<float>(msg.balance()/100)
+		);
+		break;
+	}
+	case k_EMsgClientIsLimitedAccount:
+	{
+		auto msg = protomsg_cast<CMsgClientIsLimitedAccount>(pData, dataLen);
+		printf("Client account limited?(%s), locked?(%s), community banned?(%s)\n",
+			msg.bis_limited_account() ? "yes" : "no",
+			msg.bis_locked_account() ? "yes" : "no",
+			msg.bis_community_banned() ? "yes" : "no"
+		);
+		break;
+	}
+	case k_EMsgClientUpdateMachineAuth:
+	{
+		auto msg = protomsg_cast<CMsgClientUpdateMachineAuth>(pData, dataLen);
+		printf("Got new sentry file, save to sentry.bin\n");
+
+		std::ofstream out("sentry.bin", std::ofstream::out | std::ofstream::binary);
+		out.write(msg.bytes().c_str(), msg.bytes().size());
+		out.close();
+		break;
+	}
+	case k_EMsgClientNewLoginKey:
+	{
+		printf("Get a new login key, shall we accept it?\n");
+		break;
+	}
+	case k_EMsgClientPersonaState:
+	{
+		auto msg = protomsg_cast<CMsgClientPersonaState>(pData, dataLen);
+		printf("Got new persona state flags 0x%X\n", msg.status_flags());
+		break;
+	}
+	case k_EMsgClientAuthListAck:
+	{
+		printf("CM Server has received our auth ticket list\n");
+		break;
+	}
+	case k_EMsgClientTicketAuthComplete:
+	{
+		printf("One of our auth session ticket has been authenticated.\n");
+		break;
+	}
+
+	//For now we silently drop these first
+	case k_EMsgClientServiceCall:
+	case k_EMsgServiceMethod:
+	case k_EMsgClientFriendsGroupsList:
+	case k_EMsgClientVACBanStatus:
+	case k_EMsgClientConcurrentSessionsBase:
+	case k_EMsgClientRequestedClientStats:
+	case k_EMsgClientPlayerNicknameList: //maybe too many, don't display
+	case k_EMsgClientFriendsList: //maybe too many, don't display
+	case k_EMsgClientServersAvailable:
+	case k_EMsgClientLicenseList:
+	case k_EMsgClientUpdateGuestPassesList:
+		break;
 	default:
-		printf("Received protobuf %d but we don't have handler for it.\n", type);
+		printf("*** Received protobuf %d but we don't have handler for it. ***\n", type);
 		break;
 	}
 
