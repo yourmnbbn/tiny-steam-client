@@ -1,7 +1,16 @@
 # tiny-steam-client
  A replacement of steam_api for [tiny-csgo-client](https://github.com/yourmnbbn/tiny-csgo-client) and [tiny-csgo-server](https://github.com/yourmnbbn/tiny-csgo-server).   
 
- Currently it's a very incomplete project. It's a demo of how to establish encrypted channel with steam CM server and logon your steam account. In the future, tiny-steam-client will be designed as a replacement for steam_api to get rid of the tons of limitations brought by steam_api.  
+ Currently it's a demo. But it can do some useful things already.
+
+ ### What can it do now
+ - Automatically request steam CM server list.
+ - Establish connection with steam CM servers. 
+ - Logon your steam account. (without steam guard activated)
+ - Generating appication auth session ticket. (Can be successfully validated)
+ - Communicate with GC.
+
+  In the future, tiny-steam-client will be refactored based on the current project as a replacement for steam_api to get rid of the tons of limitations brought by steam_api.  
 
 **Note that the steam guard of the account must be turned off then the account can be logged on to steam via tiny-steam-client.**
 
