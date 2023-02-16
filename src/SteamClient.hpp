@@ -100,11 +100,11 @@ private:
 		tcp::socket socket(g_IoContext);
 		
 		m_CMServerEdp = tcp::endpoint(make_address(m_CMServerIP), m_CMServerPort);
-
+		
 		co_await socket.async_connect(m_CMServerEdp, asio::use_awaitable);
-		auto len = co_await socket.async_read_some(asio::buffer(m_ReadBuf, sizeof(m_ReadBuf)), asio::use_awaitable);
+		auto len = co_await ReceiveSingleFrame(socket);
+		
 		bf_read reader(m_ReadBuf, len);
-
 		auto payloadLength = CheckPacketHeader(reader, len);
 		if (payloadLength < 1)
 			co_return;
@@ -149,14 +149,14 @@ private:
 		m_Writer.WriteBytes(cipherMem.get(), cipherLen);
 		m_Writer.WriteLong(crc32);
 		m_Writer.WriteLong(0);
-
-		co_await socket.async_write_some(asio::buffer(m_WriteBuf, m_Writer.GetNumBytesWritten()), asio::use_awaitable);
+		
+		co_await socket.async_send(asio::buffer(m_WriteBuf, m_Writer.GetNumBytesWritten()), asio::use_awaitable);
 		co_await ProcessEncryptedChannelResult(socket);
 	}
 
 	asio::awaitable<void> ProcessEncryptedChannelResult(tcp::socket& socket)
 	{
-		auto len = co_await socket.async_read_some(asio::buffer(m_ReadBuf), asio::use_awaitable);
+		auto len = co_await ReceiveSingleFrame(socket);
 		bf_read reader(m_ReadBuf, len);
 
 		auto payloadLength = CheckPacketHeader(reader, len);
@@ -188,7 +188,6 @@ private:
 	asio::awaitable<void> UserLogon(tcp::socket& socket, const char* username, const char* passwd)
 	{
 		printf("Logging on to steam, account: %s ...\n", username);
-
 		
 		CMsgProtoBufHeader header;
 		header.set_client_sessionid(0);
@@ -215,7 +214,8 @@ private:
 	{
 		while (true)
 		{
-			auto len = co_await socket.async_read_some(asio::buffer(m_ReadBuf, sizeof(m_ReadBuf)), asio::use_awaitable);
+			auto len = co_await ReceiveSingleFrame(socket);
+
 			len = co_await DecryptIncommingPacket(len);
 			if (len < 0)
 			{
@@ -234,16 +234,24 @@ private:
 		if (payloadLength < 1)
 			co_return 0;
 
-		//Decrypt received cipher
-		std::unique_ptr<char[]> memBlock = std::make_unique<char[]>(payloadLength);
-		auto plainTextLength = GetCryptoTool().SymmetricDecryptWithHMACIV(
-			m_ReadBuf + reader.GetNumBytesRead(),
-			reader.GetNumBytesLeft(),
-			memBlock.get(),
-			payloadLength);
+		try
+		{
+			//Decrypt received cipher
+			std::unique_ptr<char[]> memBlock = std::make_unique<char[]>(payloadLength);
+			auto plainTextLength = GetCryptoTool().SymmetricDecryptWithHMACIV(
+				m_ReadBuf + reader.GetNumBytesRead(),
+				reader.GetNumBytesLeft(),
+				memBlock.get(),
+				payloadLength);
 
-		memcpy(m_ReadBuf, memBlock.get(), plainTextLength);
-		co_return plainTextLength;
+			memcpy(m_ReadBuf, memBlock.get(), plainTextLength);
+			co_return plainTextLength;
+		}
+		catch (const std::exception& e)
+		{
+			printf("Decryption error! %s\n", e.what());
+			co_return 0;
+		}
 	}
 
 	asio::awaitable<void> HandleIncommingPacket(tcp::socket& socket, size_t length)
@@ -346,6 +354,8 @@ private:
 				g_IoContext.stop();
 				break;
 			}
+
+			co_return;
 		}
 
 		co_await NetMsgHandler::HandleMessage(socket, eproto, m_ReadBuf + 8 + headerLen, length - 8 - headerLen);
@@ -418,7 +428,18 @@ private:
 		m_Writer.WriteLong(MAGIC);
 
 		GetCryptoTool().SymmetricEncryptWithHMACIV(msgBlock.get(), msgLen, m_WriteBuf + m_Writer.GetNumBytesWritten(), sizeof(m_WriteBuf) - m_Writer.GetNumBytesWritten());
-		co_await socket.async_write_some(asio::buffer(m_WriteBuf, m_Writer.GetNumBytesWritten() + cipherLen), asio::use_awaitable);
+		co_await socket.async_send(asio::buffer(m_WriteBuf, m_Writer.GetNumBytesWritten() + cipherLen), asio::use_awaitable);
+	}
+
+	asio::awaitable<size_t> ReceiveSingleFrame(tcp::socket& socket)
+	{
+		//First we receive the next packet payload size
+		co_await asio::async_read(socket, asio::buffer(m_ReadBuf, 4), asio::use_awaitable);
+		auto payloadLength = *(uint32_t*)m_ReadBuf;
+
+		//Read magic(4 bytes) + payload
+		co_await asio::async_read(socket, asio::buffer(m_ReadBuf + 4, payloadLength + 4), asio::use_awaitable);
+		co_return payloadLength + 8;
 	}
 
 public:
