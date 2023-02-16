@@ -11,6 +11,8 @@
 #include "consts/logonresult.hpp"
 #include "proto/steammessages_clientserver_login.pb.h"
 #include "proto/steammessages_clientserver.pb.h"
+#include "proto/steammessages_clientserver_2.pb.h"
+#include "proto/steammessages_clientserver_friends.pb.h"
 #include "proto/enums_clientserver.pb.h"
 #include "steam/steamclientpublic.h"
 
@@ -21,6 +23,7 @@ inline asio::io_context g_IoContext;
 inline constexpr auto MAGIC						= 0x31305456;
 inline constexpr auto AES_KEY_LENGTH			= 32;
 inline constexpr auto PROTO_MASK				= (1 << 31);
+inline constexpr auto APP_ID					= 730;
 
 inline constexpr auto CLIENT_PROTOCOL_VERSION	= 65580;
 
@@ -309,16 +312,28 @@ private:
 			{
 				m_HeartbeatInterval = logonResponse.heartbeat_seconds();
 				m_PublicIP = logonResponse.public_ip().v4();
-				
-				printf("Generating app auth session ticket...\n");
-				//Send request to get csgo's ownership ticket
+
 				CMsgProtoBufHeader header;
 				header.set_client_sessionid(m_SessionID);
 				header.set_steamid(m_SteamID);
+				
+				//Tell steam that we are online
+				CMsgClientChangeStatus status;
+				status.set_persona_state(1);
+				co_await SendMessageToCM(socket, k_EMsgClientChangeStatus, header, status);
+
+				//Tell steam that we are playing csgo
+				CMsgClientGamesPlayed games;
+				auto* game = games.add_games_played();
+				game->set_game_id(APP_ID);
+				co_await SendMessageToCM(socket, k_EMsgClientGamesPlayed, header, games);
+
+				printf("Generating app auth session ticket...\n");
+				//Send request to get csgo's ownership ticket
 				header.set_jobid_source(1);
 				
 				CMsgClientGetAppOwnershipTicket getTicket;
-				getTicket.set_app_id(730);
+				getTicket.set_app_id(APP_ID);
 				co_await SendMessageToCM(socket, k_EMsgClientGetAppOwnershipTicket, header, getTicket);
 
 				//Start heart beat process
@@ -347,6 +362,39 @@ private:
 			CMsgClientHeartBeat heartbeat;
 			co_await SendMessageToCM(socket, k_EMsgClientHeartBeat, header, heartbeat);
 		}
+	}
+
+	asio::awaitable<void> SendMessageToGC(tcp::socket& socket, uint32_t type, google::protobuf::Message& msg)
+	{
+		struct GCMsgHdr_t
+		{
+			uint32	m_eMsg;					// The message type
+			uint32	m_nSrcGCDirIndex;		// The GC index that this message was sent from (set to the same as the current GC if not routed through another GC)
+		};
+
+		auto size = msg.ByteSize() + sizeof(GCMsgHdr_t);
+		std::unique_ptr<char[]> memBlock = std::make_unique<char[]>(size);
+
+		GCMsgHdr_t* header = (GCMsgHdr_t*)memBlock.get();
+		header->m_eMsg = type | PROTO_MASK;
+		header->m_nSrcGCDirIndex = 0;
+
+		msg.SerializeToArray(memBlock.get() + sizeof(GCMsgHdr_t), size - sizeof(GCMsgHdr_t));
+		co_await SendMessageToGC_Proxy(socket, type, memBlock.get(), size);
+	}
+
+	asio::awaitable<void>	SendMessageToGC_Proxy(tcp::socket& socket, uint32_t type, void* pData, size_t length)
+	{
+		auto hdr = FormProtobufMsgHeader();
+		hdr.set_routing_appid(APP_ID);
+		
+		CMsgGCClient gcclient;
+		gcclient.set_appid(APP_ID);
+		gcclient.set_msgtype(type | PROTO_MASK);
+
+		gcclient.set_payload(pData, length);
+
+		co_await SendMessageToCM(socket, k_EMsgClientToGC, hdr, gcclient);
 	}
 
 	asio::awaitable<void>	SendMessageToCM(tcp::socket& socket, uint32_t type, google::protobuf::Message& header, google::protobuf::Message& msg)
@@ -390,6 +438,14 @@ public:
 		}
 
 		return payloadLength;
+	}
+
+	CMsgProtoBufHeader FormProtobufMsgHeader()
+	{
+		CMsgProtoBufHeader header;
+		header.set_steamid(m_SteamID);
+		header.set_client_sessionid(m_SessionID);
+		return header;
 	}
 
 private:
@@ -491,6 +547,20 @@ inline asio::awaitable<void> NetMsgHandler::HandleMessage(tcp::socket& socket, u
 		{
 			m_pSteamClient->m_GCTokens.push(token);
 		}
+		break;
+	}
+	case k_EMsgClientFromGC:
+	{
+		auto msg = protomsg_cast<CMsgGCClient>(pData, dataLen);
+		if (msg.appid() != APP_ID)
+		{
+			printf("Expecting gc message of app %d, but got %d\n", APP_ID, msg.appid());
+			break;
+		}
+
+		//TODO: Handle gc messages
+		auto msgType = msg.msgtype() & 0xFFFF;
+		printf("Got GC message %d\n", msgType);
 		break;
 	}
 	default:
