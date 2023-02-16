@@ -558,6 +558,24 @@ inline asio::awaitable<void> NetMsgHandler::HandleMessage(tcp::socket& socket, u
 		//So far we just print the ticket
 		printf("Following is the generated auth session ticket:\n");
 		GetCryptoTool().PrintHexBuffer(temp, writer.GetNumBytesWritten());
+
+		//Send the auth list containing our tick to CM, waiting to be authenticated.
+		auto hdr = m_pSteamClient->FormProtobufMsgHeader();
+		CMsgClientAuthList list;
+		list.add_app_ids(APP_ID);
+		list.set_tokens_left(m_pSteamClient->m_GCTokens.size());
+
+		auto* ticket = list.add_tickets();
+		ticket->set_estate(0);
+		ticket->set_steamid(0);
+		ticket->set_gameid(APP_ID);
+		ticket->set_h_steam_pipe(m_pSteamClient->m_SessionID * 10 + 5);
+
+		//Only first two ticket section is going to be listed
+		ticket->set_ticket_crc(GetCryptoTool().CalculateCRC32(temp, 52));
+		ticket->set_ticket(temp, 52); 
+
+		co_await m_pSteamClient->SendMessageToCM(socket, k_EMsgClientAuthList, hdr, list);
 		break;
 	}
 	case k_EMsgClientGameConnectTokens:
@@ -582,6 +600,12 @@ inline asio::awaitable<void> NetMsgHandler::HandleMessage(tcp::socket& socket, u
 		//TODO: Handle gc messages
 		auto msgType = msg.msgtype() & 0xFFFF;
 		printf("Got GC message %d\n", msgType);
+		break;
+	}
+	case k_EMsgClientLoggedOff:
+	{
+		auto msg = protomsg_cast<CMsgClientLoggedOff>(pData, dataLen);
+		printf("[%llu]Log off from steam, reason: %d\n", m_pSteamClient->m_SteamID, msg.eresult());
 		break;
 	}
 	default:
