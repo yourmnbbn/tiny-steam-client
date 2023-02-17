@@ -152,7 +152,7 @@ private:
 		m_Writer.WriteLong(crc32);
 		m_Writer.WriteLong(0);
 		
-		co_await socket.async_send(asio::buffer(m_WriteBuf, m_Writer.GetNumBytesWritten()), asio::use_awaitable);
+		co_await SendRawData(socket, m_WriteBuf, m_Writer.GetNumBytesWritten());
 		co_await ProcessEncryptedChannelResult(socket);
 	}
 
@@ -337,20 +337,6 @@ private:
 				status.set_persona_state(1);
 				co_await SendMessageToCM(socket, k_EMsgClientChangeStatus, header, status);
 
-				//Tell steam that we are playing csgo
-				CMsgClientGamesPlayed games;
-				auto* game = games.add_games_played();
-				game->set_game_id(APP_ID);
-				co_await SendMessageToCM(socket, k_EMsgClientGamesPlayed, header, games);
-
-				printf("Generating app auth session ticket...\n");
-				//Send request to get csgo's ownership ticket
-				header.set_jobid_source(1);
-				
-				CMsgClientGetAppOwnershipTicket getTicket;
-				getTicket.set_app_id(APP_ID);
-				co_await SendMessageToCM(socket, k_EMsgClientGetAppOwnershipTicket, header, getTicket);
-
 				//Start heart beat process
 				asio::co_spawn(g_IoContext, HeartbeatHandler(socket), asio::detached);
 				break;
@@ -369,6 +355,107 @@ private:
 		}
 
 		co_await NetMsgHandler::HandleMessage(socket, eproto, m_ReadBuf + 8 + headerLen, length - 8 - headerLen);
+	}
+
+	asio::awaitable<void> RequestAppAuthSessionTicket(tcp::socket& socket, uint32_t appid)
+	{
+		if (m_GCTokens.size() < 1)
+		{
+			printf("Generating auth session ticket for app %u failed! Not enough valid gc tokens\n", appid);
+			co_return;
+		}
+
+		//Tell steam that we are playing the game
+		auto header = FormProtobufMsgHeader();
+		CMsgClientGamesPlayed games;
+		auto* game = games.add_games_played();
+		game->set_game_id(appid);
+		co_await SendMessageToCM(socket, k_EMsgClientGamesPlayed, header, games);
+
+		char filename[64];
+		snprintf(filename, sizeof(filename), "ownership_%llu_%u.bin", m_SteamID, appid);
+
+		std::ifstream file(filename, std::ifstream::in | std::ifstream::binary | std::ifstream::ate);
+		auto fileLen = file.tellg();
+		if (fileLen < 1)
+		{
+			file.close();
+			printf("Can't find cached app %u ownership ticket for %llu\nRequesting from steam...\n", appid, m_SteamID);
+			co_await RequestOwnershipTicketFromSteam(socket, appid);
+			co_return;
+		}
+
+		file.seekg(0);
+		file.read((char*)m_OwnershipTicket, fileLen);
+		file.close();
+
+		time_t expiretime = *reinterpret_cast<const uint32_t*>(m_OwnershipTicket + 36);
+		if (expiretime < time(nullptr))
+		{
+			printf("Cached app %u ownership ticket for %llu is expired\nRequesting from steam...\n", appid, m_SteamID);
+			co_await RequestOwnershipTicketFromSteam(socket, appid);
+			co_return;
+		}
+
+		m_OwnershipTicketLength = fileLen;
+		m_OwnerShipTicketValid = true;
+		co_await BuildAndActivateAuthSessionTicket(socket, appid);
+	}
+
+	asio::awaitable<void> BuildAndActivateAuthSessionTicket(tcp::socket& socket, uint32_t appid)
+	{
+		//Form a proper auth session ticket
+		auto& token = m_GCTokens.front();
+
+		bf_write writer(m_AppAuthSessionTicket, sizeof(m_AppAuthSessionTicket));
+		writer.WriteLong(token.size());
+		writer.WriteBytes(token.c_str(), token.size());
+		writer.WriteLong(24);
+		writer.WriteLong(1);
+		writer.WriteLong(2);
+		writer.WriteLong(m_PublicIP);
+		writer.WriteLong(0);
+		writer.WriteLong((time(nullptr) + token.c_str()[0] - m_TimeWhenConnectedToCM) * 1000);
+		writer.WriteLong(++m_ConnectTimes);
+		writer.WriteLong(m_OwnershipTicketLength);
+		writer.WriteBytes(m_OwnershipTicket, m_OwnershipTicketLength);
+
+		m_GCTokens.pop();
+
+		m_AppAuthSessionTicketLength = writer.GetNumBytesWritten();
+
+		//print the ticket
+		printf("Following is the generated auth session ticket(size %d):\n", m_AppAuthSessionTicketLength);
+		GetCryptoTool().PrintHexBuffer(m_AppAuthSessionTicket, m_AppAuthSessionTicketLength);
+
+		//Send the auth list containing our tick to CM, waiting to be authenticated.
+		auto hdr = FormProtobufMsgHeader();
+		CMsgClientAuthList list;
+		list.add_app_ids(appid);
+		list.set_tokens_left(m_GCTokens.size());
+
+		auto* ticket = list.add_tickets();
+		ticket->set_estate(0);
+		ticket->set_steamid(0);
+		ticket->set_gameid(appid);
+		ticket->set_h_steam_pipe(m_SessionID * 10 + 5);
+
+		//Only first two ticket section is going to be listed
+		ticket->set_ticket_crc(GetCryptoTool().CalculateCRC32((char*)m_AppAuthSessionTicket, 52));
+		ticket->set_ticket(m_AppAuthSessionTicket, 52);
+
+		co_await SendMessageToCM(socket, k_EMsgClientAuthList, hdr, list);
+	}
+
+	asio::awaitable<void> RequestOwnershipTicketFromSteam(tcp::socket& socket, uint32_t appid)
+	{
+		//Send request to get csgo's ownership ticket
+		auto header = FormProtobufMsgHeader();
+		header.set_jobid_source(1);
+
+		CMsgClientGetAppOwnershipTicket getTicket;
+		getTicket.set_app_id(appid);
+		co_await SendMessageToCM(socket, k_EMsgClientGetAppOwnershipTicket, header, getTicket);
 	}
 
 	asio::awaitable<void> HeartbeatHandler(tcp::socket& socket)
@@ -438,7 +525,12 @@ private:
 		m_Writer.WriteLong(MAGIC);
 
 		GetCryptoTool().SymmetricEncryptWithHMACIV(msgBlock.get(), msgLen, m_WriteBuf + m_Writer.GetNumBytesWritten(), sizeof(m_WriteBuf) - m_Writer.GetNumBytesWritten());
-		co_await socket.async_send(asio::buffer(m_WriteBuf, m_Writer.GetNumBytesWritten() + cipherLen), asio::use_awaitable);
+		co_await SendRawData(socket, m_WriteBuf, m_Writer.GetNumBytesWritten() + cipherLen);
+	}
+
+	asio::awaitable<void> SendRawData(tcp::socket& socket, const char* pData, size_t length)
+	{
+		co_await socket.async_send(asio::buffer(pData, length), asio::use_awaitable);
 	}
 
 	asio::awaitable<size_t> ReceiveSingleFrame(tcp::socket& socket)
@@ -452,7 +544,7 @@ private:
 		co_return payloadLength + 8;
 	}
 
-public:
+private:
 	size_t CheckPacketHeader(bf_read& reader, size_t length)
 	{
 		auto payloadLength = reader.ReadLong();
@@ -504,6 +596,8 @@ private:
 	time_t		m_TimeWhenConnectedToCM;
 	uint8_t		m_OwnershipTicket[2048];
 	uint32_t	m_OwnershipTicketLength = 0;
+	uint8_t		m_AppAuthSessionTicket[2048];
+	uint32_t	m_AppAuthSessionTicketLength = 0;
 	uint32_t	m_PublicIP;
 	bool		m_OwnerShipTicketValid = false;
 	std::queue<std::string> m_GCTokens;
@@ -536,52 +630,26 @@ inline asio::awaitable<void> NetMsgHandler::HandleMessage(tcp::socket& socket, u
 
 		time_t expiretime = *reinterpret_cast<const uint32_t*>(response.ticket().c_str() + 36);
 		auto* tm = gmtime(&expiretime);
-		printf("Get app ownership ticket success! Ownership ticket will be expired after %d/%d/%d(Y/M/D)\n", tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday);;
+		printf("Get app ownership ticket success! Ownership ticket will be expired after %d/%d/%d(Y/M/D)\nWriting to file...", 
+			tm->tm_year + 1900, 
+			tm->tm_mon + 1, 
+			tm->tm_mday
+		);
 
+		//Copy to steam client
 		m_pSteamClient->m_OwnerShipTicketValid = true;
 		m_pSteamClient->m_OwnershipTicketLength = response.ticket().size();
 		memcpy(m_pSteamClient->m_OwnershipTicket, response.ticket().c_str(), response.ticket().size());
 
-		//Form a proper auth session ticket
-		auto& token = m_pSteamClient->m_GCTokens.front();
-		
-		char temp[2048];
-		bf_write writer(temp, sizeof(temp));
-		writer.WriteLong(token.size());
-		writer.WriteBytes(token.c_str(), token.size());
-		writer.WriteLong(24);
-		writer.WriteLong(1);
-		writer.WriteLong(2);
-		writer.WriteLong(m_pSteamClient->m_PublicIP);
-		writer.WriteLong(0);
-		writer.WriteLong((time(nullptr) + token.c_str()[0] - m_pSteamClient->m_TimeWhenConnectedToCM) * 1000);
-		writer.WriteLong(++(m_pSteamClient->m_ConnectTimes));
-		writer.WriteLong(response.ticket().size());
-		writer.WriteBytes(response.ticket().c_str(), response.ticket().size());
+		//Save the cache to file
+		char filename[64];
+		snprintf(filename, sizeof(filename), "ownership_%llu_%u.bin", m_pSteamClient->m_SteamID, response.app_id());
+		std::ofstream file(filename, std::ofstream::out | std::ofstream::binary);
+		file.write(response.ticket().c_str(), response.ticket().size());
+		file.close();
 
-		m_pSteamClient->m_GCTokens.pop();
-
-		//print the ticket
-		printf("Following is the generated auth session ticket(size %d):\n", writer.GetNumBytesWritten());
-		GetCryptoTool().PrintHexBuffer(temp, writer.GetNumBytesWritten());
-
-		//Send the auth list containing our tick to CM, waiting to be authenticated.
-		auto hdr = m_pSteamClient->FormProtobufMsgHeader();
-		CMsgClientAuthList list;
-		list.add_app_ids(APP_ID);
-		list.set_tokens_left(m_pSteamClient->m_GCTokens.size());
-
-		auto* ticket = list.add_tickets();
-		ticket->set_estate(0);
-		ticket->set_steamid(0);
-		ticket->set_gameid(APP_ID);
-		ticket->set_h_steam_pipe(m_pSteamClient->m_SessionID * 10 + 5);
-
-		//Only first two ticket section is going to be listed
-		ticket->set_ticket_crc(GetCryptoTool().CalculateCRC32(temp, 52));
-		ticket->set_ticket(temp, 52); 
-
-		co_await m_pSteamClient->SendMessageToCM(socket, k_EMsgClientAuthList, hdr, list);
+		//Build and validate auth session ticket
+		co_await m_pSteamClient->BuildAndActivateAuthSessionTicket(socket, response.app_id());
 		break;
 	}
 	case k_EMsgClientGameConnectTokens:
@@ -591,6 +659,14 @@ inline asio::awaitable<void> NetMsgHandler::HandleMessage(tcp::socket& socket, u
 		for (auto& token : tokens.tokens())
 		{
 			m_pSteamClient->m_GCTokens.push(token);
+		}
+
+		//We have to wait for GC tokens to generate auth session ticket, and for now we only generate this once
+		static bool generated = false;
+		if (!generated)
+		{
+			generated = true;
+			co_await m_pSteamClient->RequestAppAuthSessionTicket(socket, APP_ID);
 		}
 		break;
 	}
@@ -623,7 +699,7 @@ inline asio::awaitable<void> NetMsgHandler::HandleMessage(tcp::socket& socket, u
 	case k_EMsgClientEmailAddrInfo:
 	{
 		auto msg = protomsg_cast<CMsgClientEmailAddrInfo>(pData, dataLen);
-		printf("Client emial %s(validated %s)\n",
+		printf("Client email %s(validated %s)\n",
 			msg.email_address().c_str(),
 			msg.email_is_validated() ? "yes" : "no"
 		);
@@ -635,7 +711,7 @@ inline asio::awaitable<void> NetMsgHandler::HandleMessage(tcp::socket& socket, u
 		printf("Client %s a wallet, currency %d, balance %.2f\n",
 			msg.has_wallet() ? "has" : "doesn't have",
 			msg.currency(),
-			static_cast<float>(msg.balance()/100)
+			static_cast<float>(msg.balance())/100.F
 		);
 		break;
 	}
