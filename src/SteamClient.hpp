@@ -52,10 +52,12 @@ public:
 		NetMsgHandler::SetSteamClientPtr(this);
 	}
 public:
-	void SetAccount(const char* username, const char* pw)
+	void SetAccount(const char* username, const char* pw, const char* twofactor, const char* authcode)
 	{
 		m_AccountName = username;
 		m_AccountPassWord = pw;
+		m_TwoFactorCode = twofactor;
+		m_SteamAuthCode = authcode;
 	}
 
 	bool SetCMServer(const char* socketString)
@@ -206,6 +208,11 @@ private:
 		logon.set_should_remember_password(false);
 		logon.set_steam2_ticket_request(0);
 
+		if(!m_TwoFactorCode.empty())
+			logon.set_two_factor_code(m_TwoFactorCode.c_str());
+		if(!m_SteamAuthCode.empty())
+			logon.set_auth_code(m_SteamAuthCode.c_str());
+
 		co_await SendMessageToCM(socket, k_EMsgClientLogon, header, logon);
 		co_await StartMessageReceiver(socket);
 	}
@@ -349,8 +356,11 @@ private:
 				break;
 			}
 			case 85:
+				printf("Please enter yout two factor code using command-line option -tfc\n");
+				g_IoContext.stop();
+				break;
 			case 63:
-				printf("Please turn off steam guard to logon via tiny-steam-client!\n");
+				printf("Please enter your steam auth code in your email using command-line option -ac\n");
 				g_IoContext.stop();
 				break;
 			}
@@ -482,6 +492,8 @@ private:
 
 	std::string m_AccountName;
 	std::string m_AccountPassWord;
+	std::string m_TwoFactorCode;
+	std::string m_SteamAuthCode;
 
 	uint64_t	m_SteamID = 0;
 	int32_t		m_SessionID = 0;
@@ -522,12 +534,6 @@ inline asio::awaitable<void> NetMsgHandler::HandleMessage(tcp::socket& socket, u
 			co_return;
 		}
 
-		if (response.ticket().size() != 178)
-		{
-			printf("Got unexpected ownership ticket length:%d", response.ticket().size());
-			co_return;
-		}
-
 		time_t expiretime = *reinterpret_cast<const uint32_t*>(response.ticket().c_str() + 36);
 		auto* tm = gmtime(&expiretime);
 		printf("Get app ownership ticket success! Ownership ticket will be expired after %d/%d/%d(Y/M/D)\n", tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday);;
@@ -556,7 +562,7 @@ inline asio::awaitable<void> NetMsgHandler::HandleMessage(tcp::socket& socket, u
 		m_pSteamClient->m_GCTokens.pop();
 
 		//print the ticket
-		printf("Following is the generated auth session ticket:\n");
+		printf("Following is the generated auth session ticket(size %d):\n", writer.GetNumBytesWritten());
 		GetCryptoTool().PrintHexBuffer(temp, writer.GetNumBytesWritten());
 
 		//Send the auth list containing our tick to CM, waiting to be authenticated.
@@ -674,8 +680,16 @@ inline asio::awaitable<void> NetMsgHandler::HandleMessage(tcp::socket& socket, u
 		printf("One of our auth session ticket has been authenticated.\n");
 		break;
 	}
+	case k_EMsgClientItemAnnouncements:
+	{
+		auto msg = protomsg_cast<CMsgClientItemAnnouncements>(pData, dataLen);
+		printf("You've got %d new items in your account.\n", msg.count_new_items());
+		break;
+	}
 
 	//For now we silently drop these first
+	case k_EMsgClientChatOfflineMessageNotification:
+	case k_EMsgClientClanState:
 	case k_EMsgClientServiceCall:
 	case k_EMsgServiceMethod:
 	case k_EMsgClientFriendsGroupsList:
