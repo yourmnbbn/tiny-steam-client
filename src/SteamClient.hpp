@@ -45,7 +45,7 @@ class SteamClient
 {
 	friend class NetMsgHandler;
 public:
-	SteamClient(ArgParser parser) :
+	SteamClient(ArgParser& parser) :
 		m_Writer(m_WriteBuf, sizeof(m_WriteBuf)), 
 		m_Parser(parser)
 	{
