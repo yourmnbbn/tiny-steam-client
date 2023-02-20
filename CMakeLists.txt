@@ -48,6 +48,32 @@ if(MSVC)
     add_compile_options(/wd4819)
     add_link_options(/NODEFAULTLIB:libcmt.lib)
 
+elseif(("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU"))
+
+    add_definitions(
+        -D GNUC
+        -D POSIX
+        -D COMPILER_GCC
+        -D _GLIBCXX_USE_CXX11_ABI=0
+        -D CURL_STATICLIB
+    )
+    
+    set(STATIC_LIB_LIST 
+        ${CMAKE_CURRENT_SOURCE_DIR}/lib/linux32/libcurl.a
+        ${CMAKE_CURRENT_SOURCE_DIR}/lib/linux32/libssl.a
+        ${CMAKE_CURRENT_SOURCE_DIR}/lib/linux32/libcrypto.a
+        ${CMAKE_CURRENT_SOURCE_DIR}/lib/linux32/libcryptopp.a
+        ${HL2SDK-CSGO}/lib/linux32/release/libprotobuf.a
+        libpthread.so
+        libdl.so
+    )
+        
+    add_compile_options(
+        -m32 
+        -fcoroutines
+    )
+    
+    add_link_options(-m32)
 endif()
 
 add_executable(tiny-steam-client ${SRC_LIST})

@@ -90,7 +90,7 @@ public:
 				continue;
 			}
 
-			auto& option = opt.value().get();
+			auto& option = *opt.value();
 
 			option.exist = true;
 			bool getValue = option.attribute == OptionAttr::OptionalWithValue || option.attribute == OptionAttr::RequiredWithValue;
@@ -262,15 +262,15 @@ private:
 			throw std::logic_error(m_ErrorMsg);
 		}
 
-		return opt.value().get();
+		return *opt.value();
 	}
 
-	std::optional<std::reference_wrapper<Option_t>>	FindOption(const char* option)
+	std::optional<Option_t*>	FindOption(const char* option)
 	{
 		for (Option_t& opt : m_Options)
 		{
 			if (opt.name == option)
-				return opt;
+				return &opt;
 		}
 
 		return {};

@@ -22,11 +22,16 @@
  - [json](https://github.com/nlohmann/json) (provided in source)
  - CMake
 
-## Compile and Run (Currently windows only)
+## Compile and Run
 ### Windows
 1. Configure path of hl2sdk-csgo, cryptopp and Asio in `build.bat`.
 2. Run `build.bat` to compile the project.
 4. Run `tiny-steam-client.exe` with necessary commandline.
+
+### Linux
+1. Configure path of hl2sdk-csgo, cryptopp and Asio in `build.sh`.
+2. Run `build.sh` to compile the project.
+4. Run `tiny-steam-client` with necessary commandline.
 
  ## Command option notes
 - `-cm` CM server socket. (e.g. 127.0.0.1:27016) This parameter is optional, if you don't specify the server, the program will automatically load CM server from local cache or request from [web api](https://api.steampowered.com/ISteamDirectory/GetCMList/v1/?format=json&cellid=0).
