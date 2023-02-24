@@ -15,8 +15,11 @@
 #include "proto/steammessages_clientserver_friends.pb.h"
 #include "proto/enums_clientserver.pb.h"
 #include "steam/steamclientpublic.h"
+#include "WebApiHelper.hpp"
+#include "AuthClient.hpp"
 
 using namespace asio::ip;
+using namespace std::chrono_literals;
 
 inline asio::io_context g_IoContext;
 
@@ -29,30 +32,42 @@ inline constexpr auto CLIENT_PROTOCOL_VERSION	= 65580;
 
 class SteamClient;
 
+//-----------------------------------------------------------------
+//               Definition of NetMsgHandler
+//-----------------------------------------------------------------
 class NetMsgHandler
 {
 public:
-	static void SetSteamClientPtr(SteamClient* cl) { m_pSteamClient = cl; }
-	static asio::awaitable<void> HandleMessage(tcp::socket& socket, uint32_t type, void* pData, size_t dataLen);
+	void SetSteamClientPtr(SteamClient* cl) { m_pSteamClient = cl; }
+	asio::awaitable<void> HandleMessage(tcp::socket& socket, uint32_t type, void* pData, size_t dataLen);
 private:
 	template<typename MsgObjType>
 	static MsgObjType protomsg_cast(const void* data, size_t length);
 private:
-	static SteamClient* m_pSteamClient;
+	SteamClient* m_pSteamClient = nullptr;
 };
 
+//-----------------------------------------------------------------
+//               Definition of SteamClient
+//-----------------------------------------------------------------
 class SteamClient
 {
 	friend class NetMsgHandler;
-public:
-	SteamClient(ArgParser& parser) :
-		m_Writer(m_WriteBuf, sizeof(m_WriteBuf)), 
-		m_Parser(parser)
+
+	enum ConnectionState
 	{
-		NetMsgHandler::SetSteamClientPtr(this);
+		kE_NoConnection,
+		kE_ConnectedWithoutEncryptedChannel,
+		kE_ConnectedWithEncryptedChannel,
+	};
+
+public:
+	SteamClient(const char* username, const char* passwd, const char* tfc, const char* ac)
+	{
+		SetAccount(username, passwd, tfc, ac);
 	}
 public:
-	void SetAccount(const char* username, const char* pw, const char* twofactor, const char* authcode)
+	void SetAccount(const char* username, const char* pw, const char* twofactor = "", const char* authcode = "")
 	{
 		m_AccountName = username;
 		m_AccountPassWord = pw;
@@ -76,7 +91,7 @@ public:
 
 		if (index == len)
 		{
-			printf("Can't resolve CM Server address: %s\n", socketString);
+			criticalmsg("Can't resolve CM Server address: %s\n", socketString);
 			return false;
 		}
 
@@ -87,25 +102,61 @@ public:
 		return true;
 	}
 
-	void RunClient()
+	void PrepareNetwork() 
+	{ 
+		asio::co_spawn(g_IoContext, ConnectToCM(), asio::detached); 
+	}
+
+protected:
+	asio::awaitable<void>	ConnectToCM()
 	{
-		g_IoContext.reset();
-		asio::co_spawn(g_IoContext, EstablishEncryptedHandshake(), asio::detached);
-		g_IoContext.run();
+		while (true)
+		{
+			//When the code reaches here again, meaning there is something wrong with the previous connection, reconnect.
+			asio::steady_timer timer(g_IoContext, 3s);
+			co_await timer.async_wait(asio::use_awaitable);
+
+			if (!SteamWebApiHelper::CheckCachedCMList())
+				continue;
+
+			auto svsocket = SteamWebApiHelper::GetPickedCMServer();
+			SetCMServer(svsocket.c_str());
+
+			tcp::socket socket(g_IoContext);
+			co_await EstablishEncryptedHandshake(socket);
+			socket.close();
+		}
 	}
 
 private:
-	asio::awaitable<void>	EstablishEncryptedHandshake()
+	asio::awaitable<void>	EstablishEncryptedHandshake(tcp::socket& socket)
 	{
-		printf("Trying to establish connection with CM server %s:%d\n", m_CMServerIP.c_str(), m_CMServerPort);
+		criticalmsg("[%s]Trying to establish connection with CM server %s:%d\n", m_AccountName.c_str(), m_CMServerIP.c_str(), m_CMServerPort);
 
-		tcp::socket socket(g_IoContext);
-		
 		m_CMServerEdp = tcp::endpoint(make_address(m_CMServerIP), m_CMServerPort);
 		
-		co_await socket.async_connect(m_CMServerEdp, asio::use_awaitable);
-		auto len = co_await ReceiveSingleFrame(socket);
+		try
+		{
+			co_await socket.async_connect(m_CMServerEdp, asio::use_awaitable);
+		}
+		catch (const std::exception& e)
+		{
+			criticalmsg("[%s]Can't connect to %s:%d(%s), change a cm server\n",
+				m_AccountName.c_str(),
+				m_CMServerIP.c_str(),
+				m_CMServerPort,
+				e.what()
+			);
+				
+			std::this_thread::sleep_for(3s);
+			co_return;
+		}
 		
+		m_ConnectionState = kE_ConnectedWithoutEncryptedChannel;
+		auto len = co_await ReceiveSingleFrame(socket);
+		if (len < 1)
+			co_return;
+
 		bf_read reader(m_ReadBuf, len);
 		auto payloadLength = CheckPacketHeader(reader, len);
 		if (payloadLength < 1)
@@ -114,7 +165,7 @@ private:
 		auto proto_index = reader.ReadLong();
 		if (proto_index != k_EMsgChannelEncryptRequest)
 		{
-			printf("Expect protobuf %d but got %d!\n", k_EMsgChannelEncryptRequest, proto_index);
+			dbgmsg("Expect protobuf %d but got %d!\n", k_EMsgChannelEncryptRequest, proto_index);
 			co_return;
 		}
 
@@ -122,7 +173,7 @@ private:
 		auto targetJobID = reader.ReadLongLong();
 		auto protocol = reader.ReadLong();
 		auto universe = reader.ReadLong();
-		printf("CM Server wants to establish encrypted channel\nSource job id: %llx, target job id: %llx, protocol: %d, universe: %d\n",
+		dbgmsg("CM Server wants to establish encrypted channel\nSource job id: %llx, target job id: %llx, protocol: %d, universe: %d\n",
 			sourceJobID, targetJobID, protocol, universe);
 
 		auto randomChallengeLength = reader.GetNumBytesLeft();
@@ -140,25 +191,34 @@ private:
 
 		auto crc32 = GetCryptoTool().CalculateCRC32(cipherMem.get(), cipherLen);
 
+		//Temp fix for multi instances error
+		char temp[2048];
+		bf_write writer(temp, sizeof(temp));
+
 		//Form encrypt channel response
-		m_Writer.WriteLong(36 + cipherLen);
-		m_Writer.WriteLong(MAGIC);
-		m_Writer.WriteLong(k_EMsgChannelEncryptResponse);
-		m_Writer.WriteLongLong(sourceJobID);
-		m_Writer.WriteLongLong(targetJobID);
-		m_Writer.WriteLong(protocol);
-		m_Writer.WriteLong(cipherLen);
-		m_Writer.WriteBytes(cipherMem.get(), cipherLen);
-		m_Writer.WriteLong(crc32);
-		m_Writer.WriteLong(0);
+		writer.Reset();
+		writer.WriteLong(36 + cipherLen);
+		writer.WriteLong(MAGIC);
+		writer.WriteLong(k_EMsgChannelEncryptResponse);
+		writer.WriteLongLong(sourceJobID);
+		writer.WriteLongLong(targetJobID);
+		writer.WriteLong(protocol);
+		writer.WriteLong(cipherLen);
+		writer.WriteBytes(cipherMem.get(), cipherLen);
+		writer.WriteLong(crc32);
+		writer.WriteLong(0);
 		
-		co_await SendRawData(socket, m_WriteBuf, m_Writer.GetNumBytesWritten());
+		co_await SendRawData(socket, temp, writer.GetNumBytesWritten());
 		co_await ProcessEncryptedChannelResult(socket);
+		co_return;
 	}
 
 	asio::awaitable<void> ProcessEncryptedChannelResult(tcp::socket& socket)
 	{
 		auto len = co_await ReceiveSingleFrame(socket);
+		if (len < 1)
+			co_return;
+
 		bf_read reader(m_ReadBuf, len);
 
 		auto payloadLength = CheckPacketHeader(reader, len);
@@ -168,7 +228,7 @@ private:
 		auto proto_index = reader.ReadLong();
 		if (proto_index != k_EMsgChannelEncryptResult)
 		{
-			printf("Expect protobuf %d but got %d!\n", k_EMsgChannelEncryptResult, proto_index);
+			dbgmsg("Expect protobuf %d but got %d!\n", k_EMsgChannelEncryptResult, proto_index);
 			co_return;
 		}
 		
@@ -177,19 +237,20 @@ private:
 		auto result = reader.ReadLong();
 		if (result != k_EResultOK)
 		{
-			printf("EncryptChannelResult received failure code %d!\n", result);
+			dbgmsg("EncryptChannelResult received failure code %d!\n", result);
 			co_return;
 		}
 
-		printf("Successfully established encrypted channel with Steam CM server!\n");
+		criticalmsg("[%s]Successfully established encrypted channel with Steam CM server!\n", m_AccountName.c_str());
 		m_TimeWhenConnectedToCM = time(nullptr);
+		m_ConnectionState = kE_ConnectedWithEncryptedChannel;
 
 		co_await UserLogon(socket, m_AccountName.c_str(), m_AccountPassWord.c_str());
 	}
 
 	asio::awaitable<void> UserLogon(tcp::socket& socket, const char* username, const char* passwd)
 	{
-		printf("Logging on to steam, account: %s ...\n", username);
+		criticalmsg("Logging on to steam, account: %s ...\n", username);
 		
 		CMsgProtoBufHeader header;
 		header.set_client_sessionid(0);
@@ -221,12 +282,20 @@ private:
 	{
 		while (true)
 		{
+			if (m_ConnectionState != kE_ConnectedWithEncryptedChannel)
+				co_return;
+
+			asio::steady_timer timer(g_IoContext, 1s);
+			co_await timer.async_wait(asio::use_awaitable);
+
 			auto len = co_await ReceiveSingleFrame(socket);
+			if (len < 1)
+				co_return;
 
 			len = co_await DecryptIncommingPacket(len);
 			if (len < 0)
 			{
-				printf("Received error detected!\n");
+				dbgmsg("Received error detected!\n");
 				continue;
 			}
 
@@ -256,7 +325,7 @@ private:
 		}
 		catch (const std::exception& e)
 		{
-			printf("Decryption error! %s\n", e.what());
+			dbgmsg("Decryption error! %s\n", e.what());
 			co_return 0;
 		}
 	}
@@ -319,7 +388,7 @@ private:
 			CMsgClientLogonResponse logonResponse;
 			logonResponse.ParseFromArray(m_ReadBuf + 8 + headerLen, length - 8 - headerLen);
 			auto logonResult = logonResponse.eresult();
-			printf("Logon result: %s(%d)\n", s_LogonResult[logonResult], logonResult);
+			criticalmsg("[%s][%llu]Logon result: %s(%d)\n", m_AccountName.c_str(), m_SteamID, s_LogonResult[logonResult], logonResult);
 
 			switch (logonResult)
 			{
@@ -342,11 +411,11 @@ private:
 				break;
 			}
 			case 85:
-				printf("Please enter yout two factor code using command-line option -tfc\n");
+				criticalmsg("Please enter yout two factor code using command-line option -tfc\n");
 				g_IoContext.stop();
 				break;
 			case 63:
-				printf("Please enter your steam auth code in your email using command-line option -ac\n");
+				criticalmsg("Please enter your steam auth code in your email using command-line option -ac\n");
 				g_IoContext.stop();
 				break;
 			}
@@ -354,14 +423,15 @@ private:
 			co_return;
 		}
 
-		co_await NetMsgHandler::HandleMessage(socket, eproto, m_ReadBuf + 8 + headerLen, length - 8 - headerLen);
+		m_MsgHandler.SetSteamClientPtr(this);
+		co_await m_MsgHandler.HandleMessage(socket, eproto, m_ReadBuf + 8 + headerLen, length - 8 - headerLen);
 	}
 
 	asio::awaitable<void> RequestAppAuthSessionTicket(tcp::socket& socket, uint32_t appid)
 	{
 		if (m_GCTokens.size() < 1)
 		{
-			printf("Generating auth session ticket for app %u failed! Not enough valid gc tokens\n", appid);
+			criticalmsg("Generating auth session ticket for app %u failed! Not enough valid gc tokens\n", appid);
 			co_return;
 		}
 
@@ -380,7 +450,7 @@ private:
 		if (fileLen < 1)
 		{
 			file.close();
-			printf("Can't find cached app %u ownership ticket for %llu\nRequesting from steam...\n", appid, m_SteamID);
+			criticalmsg("Can't find cached app %u ownership ticket for %llu\nRequesting from steam...\n", appid, m_SteamID);
 			co_await RequestOwnershipTicketFromSteam(socket, appid);
 			co_return;
 		}
@@ -392,7 +462,7 @@ private:
 		time_t expiretime = *reinterpret_cast<const uint32_t*>(m_OwnershipTicket + 36);
 		if (expiretime < time(nullptr))
 		{
-			printf("Cached app %u ownership ticket for %llu is expired\nRequesting from steam...\n", appid, m_SteamID);
+			criticalmsg("Cached app %u ownership ticket for %llu is expired\nRequesting from steam...\n", appid, m_SteamID);
 			co_await RequestOwnershipTicketFromSteam(socket, appid);
 			co_return;
 		}
@@ -425,7 +495,7 @@ private:
 		m_AppAuthSessionTicketLength = writer.GetNumBytesWritten();
 
 		//print the ticket
-		printf("Following is the generated auth session ticket(size %d):\n", m_AppAuthSessionTicketLength);
+		criticalmsg("[%llu]Successfully generated auth session ticket(size %d):\n", m_SteamID, m_AppAuthSessionTicketLength);
 		GetCryptoTool().PrintHexBuffer(m_AppAuthSessionTicket, m_AppAuthSessionTicketLength);
 
 		//Send the auth list containing our tick to CM, waiting to be authenticated.
@@ -445,8 +515,9 @@ private:
 		ticket->set_ticket(m_AppAuthSessionTicket, 52);
 
 		co_await SendMessageToCM(socket, k_EMsgClientAuthList, hdr, list);
+		GetTicketHolder().WriteTicket((char*)m_AppAuthSessionTicket, m_AppAuthSessionTicketLength);
 	}
-
+	
 	asio::awaitable<void> RequestOwnershipTicketFromSteam(tcp::socket& socket, uint32_t appid)
 	{
 		//Send request to get csgo's ownership ticket
@@ -462,6 +533,9 @@ private:
 	{
 		while (true)
 		{
+			if (m_ConnectionState != kE_ConnectedWithEncryptedChannel)
+				co_return;
+
 			asio::steady_timer timer(g_IoContext, std::chrono::seconds(m_HeartbeatInterval));
 			co_await timer.async_wait(asio::use_awaitable);
 
@@ -506,11 +580,13 @@ private:
 
 	asio::awaitable<void>	SendMessageToCM(tcp::socket& socket, uint32_t type, google::protobuf::Message& header, google::protobuf::Message& msg)
 	{
+		char temp[4096];
 		auto headerLen = header.ByteSize();
 		auto msgLen = headerLen + 8 + msg.ByteSize();
 		std::unique_ptr<char[]> msgBlock = std::make_unique<char[]>(msgLen);
 
 		bf_write writer(msgBlock.get(), msgLen);
+		bf_write finalMsg(temp, sizeof(temp));
 
 		writer.WriteLong(type | PROTO_MASK);
 		writer.WriteLong(headerLen);
@@ -520,43 +596,67 @@ private:
 		msg.SerializeToArray(msgBlock.get() + headerLen + numBytesWritten, msgLen - headerLen - numBytesWritten);
 		
 		auto cipherLen = GetCryptoTool().GetAesCipherWithHmacLength(msgLen);
-		m_Writer.Reset();
-		m_Writer.WriteLong(cipherLen);
-		m_Writer.WriteLong(MAGIC);
+		finalMsg.Reset();
+		finalMsg.WriteLong(cipherLen);
+		finalMsg.WriteLong(MAGIC);
 
-		GetCryptoTool().SymmetricEncryptWithHMACIV(msgBlock.get(), msgLen, m_WriteBuf + m_Writer.GetNumBytesWritten(), sizeof(m_WriteBuf) - m_Writer.GetNumBytesWritten());
-		co_await SendRawData(socket, m_WriteBuf, m_Writer.GetNumBytesWritten() + cipherLen);
+		GetCryptoTool().SymmetricEncryptWithHMACIV(msgBlock.get(), msgLen, temp + finalMsg.GetNumBytesWritten(), sizeof(temp) - finalMsg.GetNumBytesWritten());
+		co_await SendRawData(socket, temp, finalMsg.GetNumBytesWritten() + cipherLen);
 	}
 
 	asio::awaitable<void> SendRawData(tcp::socket& socket, const char* pData, size_t length)
 	{
-		co_await socket.async_send(asio::buffer(pData, length), asio::use_awaitable);
+		try
+		{
+			co_await socket.async_send(asio::buffer(pData, length), asio::use_awaitable);
+		}
+		catch (const std::exception& e)
+		{
+			criticalmsg("[%llu]Caught connection exception in SendRawData(%s), reconnecting... \n", m_SteamID, e.what());
+			m_ConnectionState = kE_NoConnection;
+			
+			co_return;
+		}
 	}
 
 	asio::awaitable<size_t> ReceiveSingleFrame(tcp::socket& socket)
 	{
-		//First we receive the next packet payload size
-		co_await asio::async_read(socket, asio::buffer(m_ReadBuf, 4), asio::use_awaitable);
-		auto payloadLength = *(uint32_t*)m_ReadBuf;
+		try
+		{
+			//First we receive the next packet payload size
+			co_await asio::async_read(socket, asio::buffer(m_ReadBuf, 4), asio::use_awaitable);
+			auto payloadLength = *(uint32_t*)m_ReadBuf;
 
-		//Read magic(4 bytes) + payload
-		co_await asio::async_read(socket, asio::buffer(m_ReadBuf + 4, payloadLength + 4), asio::use_awaitable);
-		co_return payloadLength + 8;
+			//Read magic(4 bytes) + payload
+			co_await asio::async_read(socket, asio::buffer(m_ReadBuf + 4, payloadLength + 4), asio::use_awaitable);
+			co_return payloadLength + 8;
+		}
+		catch (const std::exception& e)
+		{
+			criticalmsg("[%llu]Caught connection exception in ReceiveSingleFrame(%s), reconnecting... \n", m_SteamID, e.what());
+			m_ConnectionState = kE_NoConnection;
+			
+			co_return 0;
+		}
 	}
-
+public:
+	bool ShouldExit()
+	{
+		return m_ShouldExit;
+	}
 private:
 	size_t CheckPacketHeader(bf_read& reader, size_t length)
 	{
 		auto payloadLength = reader.ReadLong();
 		if (reader.ReadLong() != MAGIC)
 		{
-			printf("Packet magic mismatch!\n");
+			dbgmsg("Packet magic mismatch!\n");
 			return 0;
 		}
 
 		if (payloadLength != length - reader.GetNumBytesRead())
 		{
-			printf("Packet payload length mismatch!(%d/%d)\n", payloadLength, length - reader.GetNumBytesRead());
+			dbgmsg("Packet payload length mismatch!(%d/%d)\n", payloadLength, length - reader.GetNumBytesRead());
 			return 0;
 		}
 
@@ -572,12 +672,7 @@ private:
 	}
 
 private:
-	ArgParser& m_Parser;
-
-	char m_WriteBuf[8192];
-	char m_ReadBuf[81920];
-
-	bf_write	m_Writer;
+	char m_ReadBuf[12288];
 
 	std::string m_CMServerIP;
 	uint16_t	m_CMServerPort;
@@ -591,9 +686,13 @@ private:
 	int32_t		m_SessionID = 0;
 	uint32_t	m_HeartbeatInterval = 5;
 
+	ConnectionState	m_ConnectionState = kE_NoConnection;
+	bool			m_ShouldExit = false;
+
 	//Used for auth session ticket generation
 	uint32_t	m_ConnectTimes = 0;
 	time_t		m_TimeWhenConnectedToCM;
+	time_t		m_TimeWhenActivateTicket;
 	uint8_t		m_OwnershipTicket[2048];
 	uint32_t	m_OwnershipTicketLength = 0;
 	uint8_t		m_AppAuthSessionTicket[2048];
@@ -603,9 +702,48 @@ private:
 	std::queue<std::string> m_GCTokens;
 
 	tcp::endpoint	m_CMServerEdp;
+	udp::endpoint	m_GameServerEdp;
+
+	NetMsgHandler	m_MsgHandler;
 };
 
-inline SteamClient* NetMsgHandler::m_pSteamClient = nullptr;
+
+//-----------------------------------------------------------------
+//               Definition of SteamClientMgr
+//-----------------------------------------------------------------
+
+class SteamClientMgr
+{
+public:
+	SteamClientMgr()
+	{
+		m_Accounts.reserve(32);
+	}
+public:
+	void AddAccount(const char* user, const char* passwd, const char* tfc = "", const char* ac = "")
+	{
+		m_Accounts.emplace_back(SteamClient{ user, passwd, tfc, ac });
+	}
+
+	void RunClients()
+	{
+		g_IoContext.reset();
+
+		for (auto& client : m_Accounts)
+		{
+			client.PrepareNetwork();
+		}
+
+		g_IoContext.run();
+	}
+private:
+	std::vector<SteamClient> m_Accounts;
+};
+
+
+//-----------------------------------------------------------------
+//               Implementation of NetMsgHandler
+//-----------------------------------------------------------------
 
 template<typename MsgObjType>
 inline MsgObjType NetMsgHandler::protomsg_cast(const void* data, size_t length)
@@ -624,13 +762,14 @@ inline asio::awaitable<void> NetMsgHandler::HandleMessage(tcp::socket& socket, u
 		auto response = protomsg_cast<CMsgClientGetAppOwnershipTicketResponse>(pData, dataLen);
 		if (response.eresult() != k_EResultOK)
 		{
-			printf("Get app owner ship response with failure code %d\n", response.eresult());
+			criticalmsg("[%llu]Get app owner ship response with failure code %d\n", m_pSteamClient->m_SteamID, response.eresult());
 			co_return;
 		}
 
 		time_t expiretime = *reinterpret_cast<const uint32_t*>(response.ticket().c_str() + 36);
 		auto* tm = gmtime(&expiretime);
-		printf("Get app ownership ticket success! Ownership ticket will be expired after %d/%d/%d(Y/M/D)\nWriting to file...", 
+		criticalmsg("[%llu]Get app ownership ticket success! Ownership ticket will be expired after %d/%d/%d(Y/M/D)\nWriting to file...\n",
+			m_pSteamClient->m_SteamID,
 			tm->tm_year + 1900, 
 			tm->tm_mon + 1, 
 			tm->tm_mday
@@ -655,17 +794,16 @@ inline asio::awaitable<void> NetMsgHandler::HandleMessage(tcp::socket& socket, u
 	case k_EMsgClientGameConnectTokens:
 	{
 		auto tokens = protomsg_cast<CMsgClientGameConnectTokens>(pData, dataLen);
-		printf("Received %d game connect tokens\n", tokens.tokens().size());
+		dbgmsg("[%llu]Received %d game connect tokens\n", m_pSteamClient->m_SteamID, tokens.tokens().size());
 		for (auto& token : tokens.tokens())
 		{
 			m_pSteamClient->m_GCTokens.push(token);
 		}
 
-		//We have to wait for GC tokens to generate auth session ticket, and for now we only generate this once
-		static bool generated = false;
-		if (!generated)
+		//We have to wait for GC tokens to generate auth session ticket, and for now we only generate this once per login session
+		if (m_pSteamClient->m_TimeWhenActivateTicket != m_pSteamClient->m_TimeWhenConnectedToCM)
 		{
-			generated = true;
+			m_pSteamClient->m_TimeWhenActivateTicket = m_pSteamClient->m_TimeWhenConnectedToCM;
 			co_await m_pSteamClient->RequestAppAuthSessionTicket(socket, APP_ID);
 		}
 		break;
@@ -675,31 +813,32 @@ inline asio::awaitable<void> NetMsgHandler::HandleMessage(tcp::socket& socket, u
 		auto msg = protomsg_cast<CMsgGCClient>(pData, dataLen);
 		if (msg.appid() != APP_ID)
 		{
-			printf("Expecting gc message of app %d, but got %d\n", APP_ID, msg.appid());
+			dbgmsg("Expecting gc message of app %d, but got %d\n", APP_ID, msg.appid());
 			break;
 		}
 
 		//TODO: Handle gc messages
 		auto msgType = msg.msgtype() & 0xFFFF;
-		printf("Got GC message %d\n", msgType);
+		dbgmsg("Got GC message %d\n", msgType);
+
 		break;
 	}
 	case k_EMsgClientLoggedOff:
 	{
 		auto msg = protomsg_cast<CMsgClientLoggedOff>(pData, dataLen);
-		printf("[%llu]Log off from steam, reason: %d\n", m_pSteamClient->m_SteamID, msg.eresult());
+		criticalmsg("[%llu]Log off from steam, reason: (%s)%d\n", m_pSteamClient->m_SteamID, s_LogonResult[msg.eresult()], msg.eresult());
 		break;
 	}
 	case k_EMsgClientAccountInfo:
 	{
 		auto msg = protomsg_cast<CMsgClientAccountInfo>(pData, dataLen);
-		printf("Username:%s, country: %s\n", msg.persona_name().c_str(), msg.ip_country().c_str());
+		dbgmsg("Username:%s, country: %s\n", msg.persona_name().c_str(), msg.ip_country().c_str());
 		break;
 	}
 	case k_EMsgClientEmailAddrInfo:
 	{
 		auto msg = protomsg_cast<CMsgClientEmailAddrInfo>(pData, dataLen);
-		printf("Client email %s(validated %s)\n",
+		dbgmsg("Client email %s(validated %s)\n",
 			msg.email_address().c_str(),
 			msg.email_is_validated() ? "yes" : "no"
 		);
@@ -708,7 +847,7 @@ inline asio::awaitable<void> NetMsgHandler::HandleMessage(tcp::socket& socket, u
 	case k_EMsgClientWalletInfoUpdate:
 	{
 		auto msg = protomsg_cast<CMsgClientWalletInfoUpdate>(pData, dataLen);
-		printf("Client %s a wallet, currency %d, balance %.2f\n",
+		dbgmsg("Client %s a wallet, currency %d, balance %.2f\n",
 			msg.has_wallet() ? "has" : "doesn't have",
 			msg.currency(),
 			static_cast<float>(msg.balance())/100.F
@@ -718,7 +857,7 @@ inline asio::awaitable<void> NetMsgHandler::HandleMessage(tcp::socket& socket, u
 	case k_EMsgClientIsLimitedAccount:
 	{
 		auto msg = protomsg_cast<CMsgClientIsLimitedAccount>(pData, dataLen);
-		printf("Client account limited?(%s), locked?(%s), community banned?(%s)\n",
+		dbgmsg("Client account limited?(%s), locked?(%s), community banned?(%s)\n",
 			msg.bis_limited_account() ? "yes" : "no",
 			msg.bis_locked_account() ? "yes" : "no",
 			msg.bis_community_banned() ? "yes" : "no"
@@ -728,38 +867,41 @@ inline asio::awaitable<void> NetMsgHandler::HandleMessage(tcp::socket& socket, u
 	case k_EMsgClientUpdateMachineAuth:
 	{
 		auto msg = protomsg_cast<CMsgClientUpdateMachineAuth>(pData, dataLen);
-		printf("Got new sentry file, save to sentry.bin\n");
+		dbgmsg("Got new sentry file, save to sentry.bin\n");
 
-		std::ofstream out("sentry.bin", std::ofstream::out | std::ofstream::binary);
+		char filename[64];
+		snprintf(filename, sizeof(filename), "sentry_%llu.bin", m_pSteamClient->m_SteamID);
+
+		std::ofstream out(filename, std::ofstream::out | std::ofstream::binary);
 		out.write(msg.bytes().c_str(), msg.bytes().size());
 		out.close();
 		break;
 	}
 	case k_EMsgClientNewLoginKey:
 	{
-		printf("Get a new login key, shall we accept it?\n");
+		dbgmsg("Get a new login key, shall we accept it?\n");
 		break;
 	}
 	case k_EMsgClientPersonaState:
 	{
 		auto msg = protomsg_cast<CMsgClientPersonaState>(pData, dataLen);
-		printf("Got new persona state flags 0x%X\n", msg.status_flags());
+		dbgmsg("Got new persona state flags 0x%X\n", msg.status_flags());
 		break;
 	}
 	case k_EMsgClientAuthListAck:
 	{
-		printf("CM Server has received our auth ticket list\n");
+		dbgmsg("CM Server has received our auth ticket list\n");
 		break;
 	}
 	case k_EMsgClientTicketAuthComplete:
 	{
-		printf("One of our auth session ticket has been authenticated.\n");
+		criticalmsg("[%llu]One of our auth session ticket has been authenticated.\n", m_pSteamClient->m_SteamID);
 		break;
 	}
 	case k_EMsgClientItemAnnouncements:
 	{
 		auto msg = protomsg_cast<CMsgClientItemAnnouncements>(pData, dataLen);
-		printf("You've got %d new items in your account.\n", msg.count_new_items());
+		dbgmsg("You've got %d new items in your account.\n", msg.count_new_items());
 		break;
 	}
 
@@ -779,7 +921,7 @@ inline asio::awaitable<void> NetMsgHandler::HandleMessage(tcp::socket& socket, u
 	case k_EMsgClientUpdateGuestPassesList:
 		break;
 	default:
-		printf("*** Received protobuf %d but we don't have handler for it. ***\n", type);
+		dbgmsg("*** Received protobuf %d but we don't have handler for it. ***\n", type);
 		break;
 	}
 

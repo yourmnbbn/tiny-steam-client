@@ -13,6 +13,7 @@
 #include <gzip.h>
 #include <zdeflate.h>
 #include "utility/checksum_crc.h"
+#include "BasicIO.hpp"
 
 using namespace CryptoPP;
 
@@ -187,9 +188,9 @@ public:
 	{
 		for (size_t i = 0; i < len; ++i)
 		{
-			printf("%02X ", ((uint8_t*)pData)[i] & 0xFF);
+			dbgmsg("%02X ", ((uint8_t*)pData)[i] & 0xFF);
 		}
-		printf("\n");
+		dbgmsg("\n");
 	}
 	
 	inline byte* GetAesKey()

@@ -185,6 +185,11 @@ public:
 		}
 	}
 
+	uint32_t OptionCount()
+	{
+		return m_Options.size();
+	}
+
 	void PrintOptions()
 	{
 		printf("Options\t\tRequired\tHas value\tDescription\n");

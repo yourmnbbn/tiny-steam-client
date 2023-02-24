@@ -3,6 +3,7 @@
 
 #include <ctime>
 #include <fstream>
+#include <mutex>
 #include "curl/curl.h"
 #include "json/json.hpp"
 #include "SteamEncryptedChannel.hpp"
@@ -20,18 +21,22 @@ public:
     {
         printf("Searching for local CM list cache...\n");
 
-        std::ifstream cmfile(CM_FILE_NAME, std::ifstream::in | std::ifstream::binary | std::ifstream::ate);
-        if (cmfile.tellg() < 1)
+        json data;
         {
-            printf("Can't find cached CM list!\n");
-            cmfile.close();
-            return GetCMList();
-        }
-        cmfile.seekg(0);
+            std::lock_guard<std::mutex> lock(m_CMListLock);
+            std::ifstream cmfile(CM_FILE_NAME, std::ifstream::in | std::ifstream::binary | std::ifstream::ate);
+            if (cmfile.tellg() < 1)
+            {
+                printf("Can't find cached CM list!\n");
+                cmfile.close();
+                return GetCMList();
+            }
+            cmfile.seekg(0);
 
-        //Parse cache
-        json data = json::parse(cmfile);
-        cmfile.close();
+            //Parse cache
+            data = json::parse(cmfile);
+            cmfile.close();
+        }
 
         //Check time
         auto tm_str = data[CM_FILE_TIME_FEILD].get<std::string>();
@@ -133,10 +138,13 @@ private:
             return false;
 
         //Write cache to file
-        std::string dump = data.dump();
-        std::ofstream out(CM_FILE_NAME, std::ofstream::out | std::ofstream::binary);
-        out.write(dump.c_str(), dump.size());
-        out.close();
+        {
+            std::lock_guard<std::mutex> lock(m_CMListLock);
+            std::string dump = data.dump();
+            std::ofstream out(CM_FILE_NAME, std::ofstream::out | std::ofstream::binary);
+            out.write(dump.c_str(), dump.size());
+            out.close();
+        }
 
         return true;
     }
@@ -158,10 +166,12 @@ private:
     static char*        m_pData;
     static size_t       m_DataLength;
     static std::string  m_CMAddr;
+    static std::mutex   m_CMListLock;
 };
 
 inline char*        SteamWebApiHelper::m_pData = nullptr;
 inline size_t       SteamWebApiHelper::m_DataLength = 0;
 inline std::string  SteamWebApiHelper::m_CMAddr;
+inline std::mutex   SteamWebApiHelper::m_CMListLock;
 
 #endif // !__TINY_STEAM_CLIENT_WEBAPIHELPER_HPP__
