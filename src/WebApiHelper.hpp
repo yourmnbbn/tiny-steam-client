@@ -22,36 +22,36 @@ public:
         printf("Searching for local CM list cache...\n");
 
         json data;
+        std::ifstream cmfile(CM_FILE_NAME, std::ifstream::in | std::ifstream::binary | std::ifstream::ate);
+        if (cmfile.tellg() < 1)
         {
-            std::lock_guard<std::mutex> lock(m_CMListLock);
-            std::ifstream cmfile(CM_FILE_NAME, std::ifstream::in | std::ifstream::binary | std::ifstream::ate);
-            if (cmfile.tellg() < 1)
-            {
-                printf("Can't find cached CM list!\n");
-                cmfile.close();
-                return GetCMList();
-            }
-            cmfile.seekg(0);
-
-            //Parse cache
-            data = json::parse(cmfile);
+            printf("Can't find cached CM list!\n");
             cmfile.close();
+            return GetCMList();
         }
+        cmfile.seekg(0);
 
-        //Check time
-        auto tm_str = data[CM_FILE_TIME_FEILD].get<std::string>();
-        time_t tm;
-        sscanf(tm_str.c_str(), "%lli", &tm);
-        time_t now = time(nullptr);
+        //Parse cache
+        data = json::parse(cmfile);
+        cmfile.close();
 
-        auto interval = now - tm;
-        auto* s_tm = gmtime(&interval);
-        if (s_tm->tm_yday > CM_CACHE_MAX_INTERVAL_DAYS)
+        //Check time if we have one
+        if (data.contains(CM_FILE_TIME_FEILD))
         {
-            printf("CM server list cache is outdated!\n");
-            //If request failed, we just use the old cache
-            if (GetCMList())
-                return true;
+            auto tm_str = data[CM_FILE_TIME_FEILD].get<std::string>();
+            time_t tm;
+            sscanf(tm_str.c_str(), "%lli", &tm);
+            time_t now = time(nullptr);
+
+            auto interval = now - tm;
+            auto* s_tm = gmtime(&interval);
+            if (s_tm->tm_yday > CM_CACHE_MAX_INTERVAL_DAYS)
+            {
+                printf("CM server list cache is outdated!\n");
+                //If request failed, we just use the old cache
+                if (GetCMList())
+                    return true;
+            }
         }
 
         return PickCMServerFromJson(data);
@@ -61,7 +61,10 @@ public:
     static std::string& GetPickedCMServer()
     {
         if (m_pData)
+        {
             delete[] m_pData;
+            m_pData = nullptr;
+        }
 
         return m_CMAddr;
     }
@@ -138,13 +141,10 @@ private:
             return false;
 
         //Write cache to file
-        {
-            std::lock_guard<std::mutex> lock(m_CMListLock);
-            std::string dump = data.dump();
-            std::ofstream out(CM_FILE_NAME, std::ofstream::out | std::ofstream::binary);
-            out.write(dump.c_str(), dump.size());
-            out.close();
-        }
+        std::string dump = data.dump();
+        std::ofstream out(CM_FILE_NAME, std::ofstream::out | std::ofstream::binary);
+        out.write(dump.c_str(), dump.size());
+        out.close();
 
         return true;
     }
@@ -152,7 +152,10 @@ private:
     static size_t CurlWriteDataCallback(void* ptr, size_t size, size_t nmemb, void* stream)
     {
         if (m_pData)
+        {
             delete[] m_pData;
+            m_pData = nullptr;
+        }
 
         m_DataLength = size * nmemb;
         m_pData = new char[m_DataLength + 1];
@@ -166,12 +169,10 @@ private:
     static char*        m_pData;
     static size_t       m_DataLength;
     static std::string  m_CMAddr;
-    static std::mutex   m_CMListLock;
 };
 
 inline char*        SteamWebApiHelper::m_pData = nullptr;
 inline size_t       SteamWebApiHelper::m_DataLength = 0;
 inline std::string  SteamWebApiHelper::m_CMAddr;
-inline std::mutex   SteamWebApiHelper::m_CMListLock;
 
 #endif // !__TINY_STEAM_CLIENT_WEBAPIHELPER_HPP__
