@@ -118,6 +118,10 @@ public:
 				throw std::logic_error(m_ErrorMsg);
 			}
 
+			//We don't have this option in the given argument list
+			if (!opt.exist)
+				continue;
+
 			//Check option value type
 			bool requireValue = opt.attribute == OptionAttr::OptionalWithValue || opt.attribute == OptionAttr::RequiredWithValue;
 			if (!requireValue)
