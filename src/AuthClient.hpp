@@ -89,6 +89,13 @@ private:
 		udp::socket socket(s_IoContext, udp::endpoint(udp::v4(), 0));
 		m_GameServerEdp = udp::endpoint(make_address(ip), port);
 
+#ifdef COMPILER_MSVC
+		//In some early version of windows, unreachable udp packet will trigger a 10045 error
+		DWORD dwBytesReturned = 0;
+		BOOL bNewBehavior = FALSE;
+		WSAIoctl(socket.native_handle(), SIO_UDP_CONNRESET, &bNewBehavior, sizeof(bNewBehavior), NULL, 0, &dwBytesReturned, NULL, NULL);
+#endif // COMPILER_MSVC
+
 		auto ticket = GetTicketHolder().ReadTicket();
 		auto steamid = *reinterpret_cast<uint64_t*>((uintptr_t)ticket.c_str() + 12);
 
